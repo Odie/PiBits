@@ -693,52 +693,70 @@ init_hardware(void)
 		// Initialise PWM
 		pwm_reg[PWM_CTL] = 0;
 		udelay(10);
-		clk_reg[PWMCLK_CNTL] = 0x5A000006;		// Source=PLLD (500MHz)
+
+		clk_reg[PWMCLK_CNTL] = 0x5A000006;            // Source=PLLD (500MHz)
 		udelay(100);
+
 		clk_reg[PWMCLK_DIV] = 0x5A000000 | (500<<12);	// set pwm div to 500, giving 1MHz
 		udelay(100);
-		clk_reg[PWMCLK_CNTL] = 0x5A000016;		// Source=PLLD and enable
+
+		clk_reg[PWMCLK_CNTL] = 0x5A000016;            // Source=PLLD and enable
 		udelay(100);
+
 		pwm_reg[PWM_RNG1] = step_time_us;
 		udelay(10);
+
+		// Enable the PWM peripheral
+		// Note: Cannot find documentation on THRSHLD
 		pwm_reg[PWM_DMAC] = PWMDMAC_ENAB | PWMDMAC_THRSHLD;
 		udelay(10);
+
+		// Clear the PWM fifo
 		pwm_reg[PWM_CTL] = PWMCTL_CLRF;
 		udelay(10);
+
+		// Enable channel 1
+		// Channel 1 uses FIFO for transmission
 		pwm_reg[PWM_CTL] = PWMCTL_USEF1 | PWMCTL_PWEN1;
 		udelay(10);
 	} else {
 		// Initialise PCM
-		pcm_reg[PCM_CS_A] = 1;				// Disable Rx+Tx, Enable PCM block
+		pcm_reg[PCM_CS_A] = 1;                // Disable Rx+Tx, Enable PCM block
 		udelay(100);
-		clk_reg[PCMCLK_CNTL] = 0x5A000006;		// Source=PLLD (500MHz)
+		clk_reg[PCMCLK_CNTL] = 0x5A000006;    // Source=PLLD (500MHz)
 		udelay(100);
 		clk_reg[PCMCLK_DIV] = 0x5A000000 | (500<<12);	// Set pcm div to 500, giving 1MHz
 		udelay(100);
-		clk_reg[PCMCLK_CNTL] = 0x5A000016;		// Source=PLLD and enable
+		clk_reg[PCMCLK_CNTL] = 0x5A000016;    // Source=PLLD and enable
 		udelay(100);
 		pcm_reg[PCM_TXC_A] = 0<<31 | 1<<30 | 0<<20 | 0<<16; // 1 channel, 8 bits
 		udelay(100);
 		pcm_reg[PCM_MODE_A] = (step_time_us - 1) << 10;
 		udelay(100);
-		pcm_reg[PCM_CS_A] |= 1<<4 | 1<<3;		// Clear FIFOs
+		pcm_reg[PCM_CS_A] |= 1<<4 | 1<<3;     // Clear FIFOs
 		udelay(100);
-		pcm_reg[PCM_DREQ_A] = 64<<24 | 64<<8;		// DMA Req when one slot is free?
+		pcm_reg[PCM_DREQ_A] = 64<<24 | 64<<8; // DMA Req when one slot is free?
 		udelay(100);
-		pcm_reg[PCM_CS_A] |= 1<<9;			// Enable DMA
+		pcm_reg[PCM_CS_A] |= 1<<9;            // Enable DMA
 		udelay(100);
 	}
 
 	// Initialise the DMA
-	dma_reg[DMA_CS] = DMA_RESET;
+	dma_reg[DMA_CS] = DMA_RESET;          // Reset the DMA
 	udelay(10);
-	dma_reg[DMA_CS] = DMA_INT | DMA_END;
+	dma_reg[DMA_CS] = DMA_INT | DMA_END;  // Clear interrup and end flag bits
+	dma_reg[DMA_DEBUG] = 7;               // Clear all error flags
 	dma_reg[DMA_CONBLK_AD] = mem_virt_to_phys(cb_base);
-	dma_reg[DMA_DEBUG] = 7; // clear debug error flags
-	dma_reg[DMA_CS] = 0x10880001;	// go, mid priority, wait for outstanding writes
+
+	// Set bits
+	//  0   (activate DMA),
+	//  19  (mid AXI priority),
+	//  23  (mid AXI panic priority),
+	//  28  (WAIT_FOR_OUTSTANDING_WRITES)
+	dma_reg[DMA_CS] = 0x10880001;
 
 	if (delay_hw == DELAY_VIA_PCM) {
-		pcm_reg[PCM_CS_A] |= 1<<2;			// Enable Tx
+		pcm_reg[PCM_CS_A] |= 1<<2;    // Enable Tx
 	}
 }
 
