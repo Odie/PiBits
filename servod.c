@@ -20,6 +20,31 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+/*
+ * Hardware timed PWM signal generation
+ *
+ * The basic idea is as follows:
+ * - Set PWM clock rate to 1Mhz
+ * - Set PWM to signal at 10 clock steps => 10us
+ * - Setup looping DMA transfer:
+ *   - Write data to GPCLR register
+ *   - Write data to GPSET register
+ *   - Transfer junk data to PWM fifo and wait a DREQ signal which should
+ *     trigger at the next clock step (10us)
+ *
+ */
+
+/*
+ * References:
+ *  processor documentation is at: http://www.raspberrypi.org/wp-content/uploads/2012/02/BCM2835-ARM-Peripherals.pdf
+ *    pg 38 for DMA
+ *    pg 61 for DMA DREQ PERMAP
+ *    pg 89 for gpio
+ *    pg 119 for PCM
+ *    pg 138 for PWM
+ *    pg 172 for timer info
+ * Addendum is http://www.scribd.com/doc/127599939/BCM2835-Audio-clocks
+ */
 /* TODO: Separate idle timeout handling from genuine set-to-zero requests */
 /* TODO: Add ability to specify time frame over which an adjustment should be made */
 /* TODO: Add servoctl utility to set and query servo positions, etc */
@@ -56,8 +81,8 @@
 
 #define MAX_MEMORY_USAGE  (16*1024*1024)	// Somewhat arbitrary limit of 16MB
 
-#define DEFAULT_CYCLE_TIME_US	20000
-#define DEFAULT_STEP_TIME_US	10
+#define DEFAULT_CYCLE_TIME_US	20000       // Default cycle time is 20ms
+#define DEFAULT_STEP_TIME_US	10          // Default step time is 10us
 #define DEFAULT_SERVO_MIN_US	500
 #define DEFAULT_SERVO_MAX_US	2500
 
@@ -334,8 +359,22 @@ static int servo_max_ticks;
 static int num_samples;
 static int num_cbs;
 static int num_pages;
+
+// Points to array of "num_samples" size.
+// Each store the content to be sent to GPCLR at each time step.
 static uint32_t *turnoff_mask;
+
+// Points to array of "MAX_SERVOS" size, referenced by DMA transfers
+// Each stores the mask to use to turn on said servo.
+// This is the content sent to the GPSET register.
+// Zeroing the mask of a particular makes it so a pulse will never start.
 static uint32_t *turnon_mask;
+
+// DMA control structure
+// We will setup a looping transfer that references sends turnoff_mask and
+// turnon_mask periodically.
+// This means we don't have to change the DMA control loop itself.
+// We can change the contents of the said fields to alter the pulse behavior.
 static dma_cb_t *cb_base;
 
 static int board_model;
@@ -613,6 +652,9 @@ init_ctrl_data(void)
 	int servo, i, numservos = 0, curstart = 0;
 	uint32_t maskall = 0;
 
+	// Where are the "set" and "clear" registers?
+	// Writing the nth bit into the registers causes the nth GPIO pin
+	// to become "set" or "cleared".
 	if (invert) {
 		phys_gpclr0 = GPIO_PHYS_BASE + 0x1c;
 		phys_gpset0 = GPIO_PHYS_BASE + 0x28;
@@ -623,25 +665,38 @@ init_ctrl_data(void)
 
 	if (delay_hw == DELAY_VIA_PWM) {
 		phys_fifo_addr = PWM_PHYS_BASE + 0x18;
+
+		// DMA_NO_WIDE_BURSTS: Cannot find documentation
+		// DMA_WAIT_RESP:   Do not stack writes into the AXI bus pipline
+		// DMA_D_DREQ:      DREQ selected by PERMAP will gate the destination writes
+		// DMA_PER_MAP(5):  Select the PWM peripheral (ref: pg. 61)
 		cbinfo = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(5);
+
 	} else {
 		phys_fifo_addr = PCM_PHYS_BASE + 0x04;
 		cbinfo = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(2);
 	}
 
+	// Zero out the "turnon_mask" for all servos being controlled
 	memset(turnon_mask, 0, MAX_SERVOS * sizeof(*turnon_mask));
 
+	// Zero out all servo pulse widths
 	for (servo = 0 ; servo < MAX_SERVOS; servo++) {
 		servowidth[servo] = 0;
+
+		// Also count number of servos and
+		// construct a gpio mask of all said controlled servos
 		if (servo2gpio[servo] != DMY) {
 			numservos++;
 			maskall |= 1 << servo2gpio[servo];
 		}
 	}
 
+	// Set "turnoff_mask" to a mask of all servos under our control
 	for (i = 0; i < num_samples; i++)
 		turnoff_mask[i] = maskall;
 
+	// Spread out the start time of the various servos across our samples
 	for (servo = 0; servo < MAX_SERVOS; servo++) {
 		if (servo2gpio[servo] != DMY) {
 			servostart[servo] = curstart;
@@ -649,10 +704,16 @@ init_ctrl_data(void)
 		}
 	}
 
+	// Find the first active servo
 	servo = 0;
 	while (servo < MAX_SERVOS && servo2gpio[servo] == DMY)
 		servo++;
 
+	// Setup DMA transfers
+	//
+	// We're going to setup all "samples" which represents the desired
+	// pulse states at the each step in the cycle_time / step_time points
+	//
 	for (i = 0; i < num_samples; i++) {
 		cbp->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
 		cbp->src = mem_virt_to_phys(turnoff_mask + i);
@@ -694,18 +755,28 @@ init_hardware(void)
 		pwm_reg[PWM_CTL] = 0;
 		udelay(10);
 
-		clk_reg[PWMCLK_CNTL] = 0x5A000006;            // Source=PLLD (500MHz)
+		/**************************************************************************
+		 *  Set PWM peripheral clock rate to 1MHz
+		 *  This gives 1us per step
+		 **************************************************************************/
+		clk_reg[PWMCLK_CNTL] = 0x5A000006;            // Clock Source=PLLD (500MHz)
 		udelay(100);
 
-		clk_reg[PWMCLK_DIV] = 0x5A000000 | (500<<12);	// set pwm div to 500, giving 1MHz
+		clk_reg[PWMCLK_DIV] = 0x5A000000 | (500<<12);	// Set pwm div to 500, giving 1MHz
 		udelay(100);
 
 		clk_reg[PWMCLK_CNTL] = 0x5A000016;            // Source=PLLD and enable
 		udelay(100);
 
+		/**************************************************************************
+		 *  Set PWM range to 10 steps => 10us
+		 **************************************************************************/
 		pwm_reg[PWM_RNG1] = step_time_us;
 		udelay(10);
 
+		/**************************************************************************
+		 *  Enable PWM & PWM1
+		 **************************************************************************/
 		// Enable the PWM peripheral
 		// Note: Cannot find documentation on THRSHLD
 		pwm_reg[PWM_DMAC] = PWMDMAC_ENAB | PWMDMAC_THRSHLD;
@@ -741,7 +812,9 @@ init_hardware(void)
 		udelay(100);
 	}
 
-	// Initialise the DMA
+	/****************************************************************************
+	 *  Initialize and start the DMA
+	 ****************************************************************************/
 	dma_reg[DMA_CS] = DMA_RESET;          // Reset the DMA
 	udelay(10);
 	dma_reg[DMA_CS] = DMA_INT | DMA_END;  // Clear interrup and end flag bits
