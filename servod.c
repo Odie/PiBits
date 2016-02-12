@@ -332,14 +332,24 @@ static uint8_t bplus_p1pin2gpio_map[] = {
 static int cycle_time_us;
 static int step_time_us;
 
-static uint8_t servo2gpio[MAX_SERVOS];
-static uint8_t p1pin2servo[NUM_P1PINS+1];
-static uint8_t p5pin2servo[NUM_P5PINS+1];
-static int servostart[MAX_SERVOS];
-static int servowidth[MAX_SERVOS];
-static int num_servos;
-static uint32_t gpiomode[MAX_SERVOS];
-static int restore_gpio_modes;
+// Records info regarding a single pin under our control
+typdef struct {
+	uint8_t pin;                  // Which GPIO pin?
+	uint16_t startSample;         // On which sample should the pin start its pulse?
+	uint16_t pulseWidthTimesteps; // Pulse width in timesteps
+	uint32_t oldGpioMode;         // What was the gpio mode before we took control?
+} ControlledPin;
+
+static ControlledPin* controlledPins;
+
+/* static uint8_t servo2gpio[MAX_SERVOS]; */
+/* static uint8_t p1pin2servo[NUM_P1PINS+1]; */
+/* static uint8_t p5pin2servo[NUM_P5PINS+1]; */
+/* static int servostart[MAX_SERVOS]; */
+/* static int servowidth[MAX_SERVOS]; */
+/* static int num_servos = MAX_SERVOS; */
+/* static uint32_t gpiomode[MAX_SERVOS]; */
+/* static int restore_gpio_modes; */
 
 static volatile uint32_t *pwm_reg;
 static volatile uint32_t *pcm_reg;
@@ -642,6 +652,7 @@ setup_sighandlers(void)
 	}
 }
 
+
 static void
 init_ctrl_data(void)
 {
@@ -692,7 +703,7 @@ init_ctrl_data(void)
 		}
 	}
 
-	// Set "turnoff_mask" to a mask of all servos under our control
+	// Initialize "turnoff_masks" so we're always turning off the servos
 	for (i = 0; i < num_samples; i++)
 		turnoff_mask[i] = maskall;
 
