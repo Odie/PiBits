@@ -3,7 +3,8 @@
 all:	servod
 
 servod:	servod.c mailbox.c
-	gcc -Wall -g -O2 -o servod servod.c mailbox.c -lm
+	gcc -std=c11 -fdiagnostics-color=auto -D_POSIX_C_SOURCE=199309L -Wall -g -rdynamic -o servod servod.c mailbox.c -lm
+	#gcc -std=c11 -fdiagnostics-color=auto -D_POSIX_C_SOURCE=199309L -Wall -g -O2 -o servod servod.c mailbox.c -lm
 
 install: servod
 	[ "`id -u`" = "0" ] || { echo "Must be run as root"; exit 1; }

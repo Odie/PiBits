@@ -50,6 +50,7 @@
 /* TODO: Add servoctl utility to set and query servo positions, etc */
 /* TODO: Add slow-start option */
 
+#define _BSD_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -66,6 +67,8 @@
 #include <sys/mman.h>
 #include <getopt.h>
 #include <math.h>
+#include <stdbool.h>
+#include <execinfo.h>
 
 #include "mailbox.h"
 
@@ -121,7 +124,7 @@
 #define DMA_NO_WIDE_BURSTS (1<<26)
 #define DMA_WAIT_RESP      (1<<3)
 #define DMA_D_DREQ         (1<<6)
-#define DMA_PER_MAP        (x) ((x)<<16)
+#define DMA_PER_MAP(x)     ((x)<<16)
 #define DMA_END            (1<<1)
 #define DMA_RESET          (1<<31)
 #define DMA_INT            (1<<2)
@@ -332,9 +335,14 @@ static uint8_t bplus_p1pin2gpio_map[] = {
 static int cycle_time_us;
 static int step_time_us;
 
+/*****************************************************************************
+ * ControlledPin
+ *
+ * Records information regarding a single pin that we're controlling
+ *****************************************************************************/
 // Records info regarding a single pin under our control
-typdef struct {
-	uint8_t pin;                  // Which GPIO pin?
+typedef struct {
+	uint8_t bcmPin;               // Which GPIO pin?
 	uint16_t startSample;         // On which sample should the pin start its pulse?
 	uint16_t pulseWidthTimesteps; // Pulse width in timesteps
 	uint32_t oldGpioMode;         // What was the gpio mode before we took control?
@@ -342,9 +350,35 @@ typdef struct {
 
 static ControlledPin* controlledPins;
 
+static void
+cpInit(ControlledPin* pin) {
+	pin->bcmPin = DMY;
+	pin->startSample = 0;
+	pin->pulseWidthTimesteps = 0;
+	pin->oldGpioMode = 0;
+}
+
+static bool
+cpIsValid(ControlledPin* pin) {
+	if (pin->bcmPin == DMY)
+		return false;
+	return true;
+}
+
+static int
+cpTotalCount() {
+	int count = 0;
+	for (int i = 0; i < MAX_SERVOS; i++) {
+		if (cpIsValid(&controlledPins[i]))
+			count++;
+	}
+	return count;
+}
+
+
 /* static uint8_t servo2gpio[MAX_SERVOS]; */
-/* static uint8_t p1pin2servo[NUM_P1PINS+1]; */
-/* static uint8_t p5pin2servo[NUM_P5PINS+1]; */
+static uint8_t p1pin2servo[NUM_P1PINS+1];
+static uint8_t p5pin2servo[NUM_P5PINS+1];
 /* static int servostart[MAX_SERVOS]; */
 /* static int servowidth[MAX_SERVOS]; */
 /* static int num_servos = MAX_SERVOS; */
@@ -430,18 +464,17 @@ terminate(int dummy)
 
 	if (dma_reg && mbox.virt_addr) {
 		for (i = 0; i < MAX_SERVOS; i++) {
-			if (servo2gpio[i] != DMY)
+			if (cpIsValid(&controlledPins[i]))
 				set_servo(i, 0);
 		}
 		udelay(cycle_time_us);
 		dma_reg[DMA_CS] = DMA_RESET;
 		udelay(10);
 	}
-	if (restore_gpio_modes) {
-		for (i = 0; i < MAX_SERVOS; i++) {
-			if (servo2gpio[i] != DMY)
-				gpio_set_mode(servo2gpio[i], gpiomode[i]);
-		}
+	for (i = 0; i < MAX_SERVOS; i++) {
+		ControlledPin* pin = &controlledPins[i];
+		if (cpIsValid(pin))
+				gpio_set_mode(pin->bcmPin, pin->oldGpioMode);
 	}
 	if (mbox.virt_addr != NULL) {
 		unmapmem(mbox.virt_addr, mbox.size);
@@ -500,7 +533,7 @@ get_next_idle_timeout(struct timeval *tv)
 
 	gettimeofday(&now, NULL);
 	for (i = 0; i < MAX_SERVOS; i++) {
-		if (servo2gpio[i] == DMY || servo_kill_time[i].tv_sec == 0)
+		if (cpIsValid(&controlledPins[i]) || servo_kill_time[i].tv_sec == 0)
 			continue;
 		else if (servo_kill_time[i].tv_sec < now.tv_sec ||
 			(servo_kill_time[i].tv_sec == now.tv_sec &&
@@ -581,8 +614,8 @@ set_servo_idle(int servo)
 	 * truncated pulses which would make a servo change position.
 	 */
 	turnon_mask[servo] = 0;
-	if (servowidth[servo] == num_samples)
-		gpio_set(servo2gpio[servo], invert ? 1 : 0);
+	if (controlledPins[servo].pulseWidthTimesteps == num_samples)
+		gpio_set(controlledPins[servo].bcmPin, invert ? 1 : 0);
 }
 
 /* Carefully add or remove bits from the turnoff_mask such that regardless
@@ -600,34 +633,35 @@ set_servo(int servo, int width)
 {
 	volatile uint32_t *dp;
 	int i;
-	uint32_t mask = 1 << servo2gpio[servo];
+	ControlledPin* pin = &controlledPins[servo];
+	uint32_t mask = 1 << pin->bcmPin;
 
 
-	if (width > servowidth[servo]) {
-		dp = turnoff_mask + servostart[servo] + width;
+	if (width > pin->pulseWidthTimesteps) {
+		dp = turnoff_mask + pin->startSample + pin->pulseWidthTimesteps;
 		if (dp >= turnoff_mask + num_samples)
 			dp -= num_samples;
 
-		for (i = width; i > servowidth[servo]; i--) {
+		for (i = width; i > pin->pulseWidthTimesteps; i--) {
 			dp--;
 			if (dp < turnoff_mask)
 				dp = turnoff_mask + num_samples - 1;
 			//printf("%5d, clearing at %p\n", dp - ctl->turnoff, dp);
 			*dp &= ~mask;
 		}
-	} else if (width < servowidth[servo]) {
-		dp = turnoff_mask + servostart[servo] + width;
+	} else if (width < pin->pulseWidthTimesteps) {
+		dp = turnoff_mask + pin->startSample + pin->pulseWidthTimesteps;
 		if (dp >= turnoff_mask + num_samples)
 			dp -= num_samples;
 
-		for (i = width; i < servowidth[servo]; i++) {
+		for (i = width; i < pin->pulseWidthTimesteps; i++) {
 			//printf("%5d, setting at %p\n", dp - ctl->turnoff, dp);
 			*dp++ |= mask;
 			if (dp >= turnoff_mask + num_samples)
 				dp = turnoff_mask;
 		}
 	}
-	servowidth[servo] = width;
+	pin->pulseWidthTimesteps = width;
 	if (width == 0) {
 		turnon_mask[servo] = 0;
 	} else {
@@ -636,6 +670,19 @@ set_servo(int servo, int width)
 	update_idle_time(servo);
 }
 
+void dump_stacktrace_on_signal(int sig) {
+  void *array[10];
+  size_t size;
+
+  size = backtrace(array, 10);
+
+  // print out all the frames to stderr
+  fprintf(stderr, "Error: signal %d:\n", sig);
+  backtrace_symbols_fd(array, size, STDERR_FILENO);
+  exit(1);
+}
+
+
 static void
 setup_sighandlers(void)
 {
@@ -643,13 +690,15 @@ setup_sighandlers(void)
 
 	// Catch all signals possible - it is vital we kill the DMA engine
 	// on process exit!
-	for (i = 0; i < 64; i++) {
-		struct sigaction sa;
+	/* for (i = 0; i < 64; i++) { */
+	/* 	struct sigaction sa; */
+  /*  */
+	/* 	memset(&sa, 0, sizeof(sa)); */
+	/* 	sa.sa_handler = terminate; */
+	/* 	sigaction(i, &sa, NULL); */
+	/* } */
 
-		memset(&sa, 0, sizeof(sa));
-		sa.sa_handler = terminate;
-		sigaction(i, &sa, NULL);
-	}
+	signal(SIGSEGV, dump_stacktrace_on_signal);   // install our handler
 }
 
 
@@ -693,13 +742,14 @@ init_ctrl_data(void)
 
 	// Zero out all servo pulse widths
 	for (servo = 0 ; servo < MAX_SERVOS; servo++) {
-		servowidth[servo] = 0;
+		ControlledPin* pin = &controlledPins[servo];
+		pin->pulseWidthTimesteps = 0;
 
 		// Also count number of servos and
 		// construct a gpio mask of all said controlled servos
-		if (servo2gpio[servo] != DMY) {
+		if (pin->bcmPin != DMY) {
 			numservos++;
-			maskall |= 1 << servo2gpio[servo];
+			maskall |= 1 << pin->bcmPin;
 		}
 	}
 
@@ -709,15 +759,17 @@ init_ctrl_data(void)
 
 	// Spread out the start time of the various servos across our samples
 	for (servo = 0; servo < MAX_SERVOS; servo++) {
-		if (servo2gpio[servo] != DMY) {
-			servostart[servo] = curstart;
-			curstart += num_samples / num_servos;
-		}
+		ControlledPin* pin = &controlledPins[servo];
+		if (!cpIsValid(pin))
+			continue;
+
+		pin->startSample = curstart;
+		curstart += num_samples / MAX_SERVOS;
 	}
 
 	// Find the first active servo
 	servo = 0;
-	while (servo < MAX_SERVOS && servo2gpio[servo] == DMY)
+	while (servo < MAX_SERVOS && !cpIsValid(&controlledPins[servo]))
 		servo++;
 
 	// Setup DMA transfers
@@ -733,7 +785,9 @@ init_ctrl_data(void)
 		cbp->stride = 0;
 		cbp->next = mem_virt_to_phys(cbp + 1);
 		cbp++;
-		if (i == servostart[servo]) {
+
+		ControlledPin* pin = &controlledPins[servo];
+		if (i == pin->startSample) {
 			cbp->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP;
 			cbp->src = mem_virt_to_phys(turnon_mask + servo);
 			cbp->dst = phys_gpset0;
@@ -742,7 +796,7 @@ init_ctrl_data(void)
 			cbp->next = mem_virt_to_phys(cbp + 1);
 			cbp++;
 			servo++;
-			while (servo < MAX_SERVOS && servo2gpio[servo] == DMY)
+			while (servo < MAX_SERVOS && !cpIsValid(&controlledPins[servo]))
 				servo++;
 		}
 		// Delay
@@ -888,10 +942,11 @@ do_debug(void)
 	printf("---------------------------\n");
 	printf("Servo  Start  Width  TurnOn\n");
 	for (i = 0; i < MAX_SERVOS; i++) {
-		if (servo2gpio[i] != DMY) {
-			printf("%3d: %6d %6d %6d\n", i, servostart[i],
-					servowidth[i], !!turnon_mask[i]);
-			mask |= 1 << servo2gpio[i];
+		ControlledPin* pin = &controlledPins[i];
+		if (cpIsValid(pin)) {
+			printf("%3d: %6d %6d %6d\n", i, pin->startSample,
+					pin->pulseWidthTimesteps, !!turnon_mask[i]);
+			mask |= 1 << pin->bcmPin;
 		}
 	}
 	printf("\nData:\n");
@@ -911,6 +966,7 @@ parse_width(int servo, char *width_arg)
 	char *p;
 	char *digits = width_arg;
 	double width;
+	ControlledPin* pin = &controlledPins[servo];
 
 	if (*width_arg == '-' || *width_arg == '+') {
 		digits++;
@@ -932,11 +988,11 @@ parse_width(int servo, char *width_arg)
 	}
 	width = floor(width);
 	if (*width_arg == '+') {
-		width = servowidth[servo] + width;
+		width = pin->pulseWidthTimesteps + width;
 		if (width > servo_max_ticks)
 			width = servo_max_ticks;
 	} else if (*width_arg == '-') {
-		width = servowidth[servo] - width;
+		width = pin->pulseWidthTimesteps - width;
 		if (width < servo_min_ticks)
 			width = servo_min_ticks;
 	}
@@ -1012,7 +1068,7 @@ go_go_go(void)
 						fprintf(stderr, "Bad input: %s", line);
 					} else if (servo < 0 || servo >= MAX_SERVOS) {
 						fprintf(stderr, "Invalid servo number %d\n", servo);
-					} else if (servo2gpio[servo] == DMY) {
+					} else if (!cpIsValid(&controlledPins[servo])) {
 						fprintf(stderr, "Servo %d is not mapped to a GPIO pin\n", servo);
 					} else if ((width = parse_width(servo, width_arg)) < 0) {
 						fprintf(stderr, "Invalid width specified\n");
@@ -1097,6 +1153,7 @@ get_model_and_revision(void)
 	}
 }
 
+
 static void
 parse_pin_lists(int p1first, char *p1pins, char*p5pins)
 {
@@ -1106,7 +1163,6 @@ parse_pin_lists(int p1first, char *p1pins, char*p5pins)
 	int lst, servo = 0;
 	FILE *fp;
 
-	memset(servo2gpio, DMY, sizeof(servo2gpio));
 	memset(p1pin2servo, DMY, sizeof(p1pin2servo));
 	memset(p5pin2servo, DMY, sizeof(p5pin2servo));
 	for (lst = 0; lst < 2; lst++) {
@@ -1155,8 +1211,7 @@ parse_pin_lists(int p1first, char *p1pins, char*p5pins)
 				if (map[pin-1] == DMY)
 					fatal("Pin %d on header %s cannot be used for a servo output\n", pin, name);
 				pNpin2servo[pin] = servo;
-				servo2gpio[servo++] = map[pin-1];
-				num_servos++;
+				controlledPins[servo++].bcmPin = map[pin-1];
 			}
 			pins = end;
 			if (*pins == ',')
@@ -1172,9 +1227,10 @@ parse_pin_lists(int p1first, char *p1pins, char*p5pins)
 			fprintf(fp, "p5pins=%s\np1pins=%s\n", p5pins, p1pins);
 		fprintf(fp, "\nServo mapping:\n");
 		for (i = 0; i < MAX_SERVOS; i++) {
-			if (servo2gpio[i] == DMY)
+			ControlledPin* pin = &controlledPins[i];
+			if (!cpIsValid(pin))
 				continue;
-			fprintf(fp, "    %2d on %-5s          GPIO-%d\n", i, gpio2pinname(servo2gpio[i]), servo2gpio[i]);
+			fprintf(fp, "    %2d on %-5s          GPIO-%d\n", i, gpio2pinname(pin->bcmPin), pin->bcmPin);
 		}
 		fclose(fp);
 	}
@@ -1270,6 +1326,10 @@ main(int argc, char **argv)
 	int daemonize = 1;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
+
+	for(int i = 0; i < MAX_SERVOS; i++) {
+		//cpInit(&controlledPins[i]);
+	}
 
 	while (1) {
 		int c;
@@ -1460,7 +1520,7 @@ main(int argc, char **argv)
 		printf("Idle timeout:              %7dms\n", idle_timeout);
 	else
 		printf("Idle timeout:             Disabled\n");
-	printf("Number of servos:          %7d\n", num_servos);
+	printf("Number of servos:          %7d\n", cpTotalCount());
 	printf("Servo cycle time:          %7dus\n", cycle_time_us);
 	printf("Pulse increment step size: %7dus\n", step_time_us);
 	printf("Minimum width value:       %7d (%dus)\n", servo_min_ticks,
@@ -1473,9 +1533,10 @@ main(int argc, char **argv)
 		printf("Using P5 pins:               %s\n", p5pins);
 	printf("\nServo mapping:\n");
 	for (i = 0; i < MAX_SERVOS; i++) {
-		if (servo2gpio[i] == DMY)
+		ControlledPin* pin = &controlledPins[i];
+		if (!cpIsValid(pin))
 			continue;
-		printf("    %2d on %-5s          GPIO-%d\n", i, gpio2pinname(servo2gpio[i]), servo2gpio[i]);
+		printf("    %2d on %-5s          GPIO-%d\n", i, gpio2pinname(pin->bcmPin), pin->bcmPin);
 	}
 	printf("\n");
 
@@ -1512,13 +1573,13 @@ main(int argc, char **argv)
 		ROUNDUP(num_samples + MAX_SERVOS, 8) * sizeof(uint32_t));
 
 	for (i = 0; i < MAX_SERVOS; i++) {
-		if (servo2gpio[i] == DMY)
+		ControlledPin* pin = &controlledPins[i];
+		if (!cpIsValid(pin))
 			continue;
-		gpiomode[i] = gpio_get_mode(servo2gpio[i]);
-		gpio_set(servo2gpio[i], invert ? 1 : 0);
-		gpio_set_mode(servo2gpio[i], GPIO_MODE_OUT);
+		pin->oldGpioMode = gpio_get_mode(pin->bcmPin);
+		gpio_set(pin->bcmPin, invert ? 1 : 0);
+		gpio_set_mode(pin->bcmPin, GPIO_MODE_OUT);
 	}
-	restore_gpio_modes = 1;
 
 	init_ctrl_data();
 	init_hardware();
